@@ -1,0 +1,120 @@
+import sys, re
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+from pyspark.sql.types import *
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+# Iceberg Glue Catalog Configuration
+spark.conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+spark.conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+spark.conf.set("spark.sql.catalog.glue_catalog.warehouse", "s3://retail-360/")
+spark.conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+raw_path = "s3://retail-360/raw/"
+# Schemas
+customer_schema = StructType([
+    StructField("customer_id", StringType(), True),
+    StructField("name", StringType(), True),
+    StructField("region", StringType(), True),
+    StructField("signup_date", StringType(), True),
+    StructField("email", StringType(), True),
+    StructField("phone", LongType(), True)
+])
+sales_schema = StructType([
+    StructField("order_id", StringType(), True),
+    StructField("customer_id", StringType(), True),
+    StructField("order_date", StringType(), True),
+    StructField("amount", DoubleType(), True),
+    StructField("channel", StringType(), True)
+])
+clickstream_schema = StructType([
+    StructField("event_id", StringType(), True),
+    StructField("customer_id", StringType(), True),
+    StructField("page", StringType(), True),
+    StructField("timestamp", StringType(), True),
+    StructField("action", StringType(), True)
+])
+support_schema = StructType([
+    StructField("ticket_id", StringType(), True),
+    StructField("customer_id", StringType(), True),
+    StructField("category", StringType(), True),
+    StructField("status", StringType(), True),
+    StructField("created_date", StringType(), True)
+])
+# Load raw datasets
+customer_df = spark.read.option("header", True).schema(customer_schema).csv(f"{raw_path}customer_fld/")
+sales_df = spark.read.option("header", True).schema(sales_schema).csv(f"{raw_path}sales_fld/")
+clickstream_df = spark.read.option("header", True).schema(clickstream_schema).csv(f"{raw_path}clickstream_fld/")
+support_df = spark.read.option("header", True).schema(support_schema).csv(f"{raw_path}support_fld/")
+#remove duplicate rows
+def remove_duplicates(df, subset_cols):
+    return df.dropDuplicates(subset_cols)
+# Mask email: show first 1 character
+def mask_email(email_col): 
+    return F.when(email_col.isNotNull(), 
+                  F.regexp_replace(email_col, r'(^.{2})(.*)(@.*$)', r'\1*****\3')) \
+            .otherwise(None)
+
+# Mask phone: mask first 6 characters, show last 4 characters (assuming 10-digit phone)
+def mask_phone(phone_col):
+    return F.when(phone_col.isNotNull() & (F.length(phone_col) == 10),
+                  F.concat(F.lit("******"), F.expr("substring(phone, 7, 4)"))) \
+            .otherwise(None)
+# Null percentage check and filter rows with any null in dataframe
+def filter_no_nulls(df):
+    non_null_cols = [c for c in df.columns]
+    for c in non_null_cols:
+        df = df.filter(F.col(c).isNotNull())
+    return df
+def compute_quality_score(df, valid_rows):
+    total = df.count()
+    valid = valid_rows.count()
+    return round((valid / total) * 100, 2) if total > 0 else 0
+# Process Customers
+customer_df = remove_duplicates(customer_df, ["customer_id"])
+# Remove customers with null name or signup_date
+customer_df = customer_df.filter(F.col("name").isNotNull() & F.col("signup_date").isNotNull())
+#new masked email and phone columns
+customer_df = customer_df.withColumn("email_masked", mask_email(F.col("email"))) \
+                         .withColumn("phone_masked", mask_phone(F.col("phone")))
+# Validate email and phone formats
+customer_df = customer_df.filter(F.col("email").rlike(r'^[\w\.-]+@[\w\.-]+\.\w+$')) \
+                         .filter(F.length(F.col("phone").cast("string")) == 10)
+customer_df = filter_no_nulls(customer_df)
+customer_df = customer_df.withColumn("signup_date", F.to_timestamp("signup_date", "yyyy-MM-dd")) \
+                         .withColumn("signup_month", F.date_format("signup_date", "MMMM")) \
+                         .withColumn("signup_year", F.year("signup_date"))
+# Process Sales
+sales_df = remove_duplicates(sales_df, ["order_id"])
+sales_df = filter_no_nulls(sales_df)
+sales_df = sales_df.withColumn("order_date", F.to_timestamp("order_date", "yyyy-MM-dd"))
+# Filter out null and non-positive amounts safely
+sales_df = sales_df.filter((F.col("amount").isNotNull()) & (F.col("amount") > 0))
+sales_df = sales_df.join(customer_df.select("customer_id", "signup_date"), "customer_id", "inner") \
+                   .filter(F.col("order_date") >= F.col("signup_date"))
+# Process Clickstream
+clickstream_df = remove_duplicates(clickstream_df, ["event_id"])
+clickstream_df = filter_no_nulls(clickstream_df)
+clickstream_df = clickstream_df.withColumn("timestamp", F.to_timestamp("timestamp", "yyyy-MM-dd HH:mm:ss"))
+# Process Support
+support_df = remove_duplicates(support_df, ["ticket_id"])
+support_df = filter_no_nulls(support_df)
+support_df = support_df.filter(F.col("customer_id").isNotNull()) \
+                       .withColumn("created_date", F.to_timestamp("created_date", "yyyy-MM-dd"))
+# Write transformed Iceberg tables partitioned as needed
+customer_df.writeTo("glue_catalog.transformed.customer_master") \
+           .using("iceberg").partitionedBy("region", "signup_year").createOrReplace()
+sales_df.writeTo("glue_catalog.transformed.sales") \
+        .using("iceberg").createOrReplace()
+clickstream_df.writeTo("glue_catalog.transformed.clickstream") \
+              .using("iceberg").createOrReplace()
+support_df.writeTo("glue_catalog.transformed.support") \
+          .using("iceberg").createOrReplace()
+job.commit()

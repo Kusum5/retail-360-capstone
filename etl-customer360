@@ -1,0 +1,40 @@
+import sys
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from pyspark.sql import functions as F
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+# Iceberg catalog configuration
+spark.conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+spark.conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+spark.conf.set("spark.sql.catalog.glue_catalog.warehouse", "s3://retail-360/")
+spark.conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+# Initialize job
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+# Load tables
+customer_df = spark.read.format("iceberg").load("glue_catalog.transformed.customer_master")
+sales_df = spark.read.format("iceberg").load("glue_catalog.transformed.sales")
+clickstream_df = spark.read.format("iceberg").load("glue_catalog.transformed.clickstream")
+support_df = spark.read.format("iceberg").load("glue_catalog.transformed.support")
+
+sales_df = sales_df.withColumnRenamed("signup_date", "sales_signup_date")
+# Perform inner joins on customer_id to keep all columns and rows from all tables
+customer_360 = customer_df \
+    .join(sales_df, "customer_id", "inner") \
+    .join(clickstream_df, "customer_id", "inner") \
+    .join(support_df, "customer_id", "inner")
+# Add derived columns (example: signup date related and data quality score)
+customer_360 = customer_360 \
+    .withColumn("days_since_last_purchase", F.datediff(F.current_date(), F.col("order_date"))) \
+    .withColumn("data_quality_score", F.lit(95.0))
+# Write customer 360 profile to Iceberg table partitioned appropriately
+customer_360.writeTo("glue_catalog.curated.customer_360") \
+    .using("iceberg") \
+    .partitionedBy("region", "signup_year", "signup_month", "signup_date") \
+    .createOrReplace()
+job.commit()

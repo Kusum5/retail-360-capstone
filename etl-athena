@@ -1,0 +1,133 @@
+import sys
+import boto3
+import json
+from botocore.exceptions import ClientError
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.types import (
+    StructType, StructField, StringType, IntegerType, DoubleType, DateType, TimestampType
+)
+# --- Step 0: Fetch credentials from Secrets Manager ---
+def get_secret():
+    secret_name = "rds"          # <-- your secret name in Secrets Manager
+    region_name = "us-east-1"    # <-- your region
+    session = boto3.session.Session()
+    client = session.client(service_name='secretsmanager', region_name=region_name)
+    try:
+        get_secret_value_response = client.get_secret_value(SecretId=secret_name)
+    except ClientError as e:
+        raise e
+    secret = get_secret_value_response['SecretString']
+    return json.loads(secret)    # returns dict with username/password/host/port
+# Get job arguments
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+# --- Step 1: Define schemas for each query ---
+schemas = {
+    "10_cus_lifecycle": StructType([
+        StructField("customer_id", StringType(), True),
+        StructField("lifetime_value", DoubleType(), True)
+    ]),
+    "Active_cus(30days)": StructType([
+        StructField("active_customers", IntegerType(), True)
+    ]),
+    "avg_order_value": StructType([
+        StructField("average_order_value", DoubleType(), True)
+    ]),
+    "Cust_lifecycle_value": StructType([
+        StructField("customer_id", StringType(), True),
+        StructField("lifetime_value", DoubleType(), True)
+    ]),
+    "Inactive_cust": StructType([
+        StructField("inactive_customers", IntegerType(), True)
+    ]),
+    "Revenue_month": StructType([
+        StructField("month", StringType(), True),
+        StructField("total_revenue", DoubleType(), True)
+    ]),
+    "Risk_based_frequency": StructType([
+        StructField("customer_id", StringType(), True),
+        StructField("churn_risk", StringType(), True)
+    ]),
+    "Risk_supp_tick": StructType([
+        StructField("customer_id", StringType(), True),
+        StructField("churn_risk", StringType(), True)
+    ]),
+    "Total_customers": StructType([
+        StructField("total_customers", IntegerType(), True)
+    ]),
+    # 10. Churn Probability
+    "Churn_probability": StructType([
+        StructField("churn_risk", StringType(), True),
+        StructField("customers", IntegerType(), True)
+    ]),
+    # 11. Customer360
+    "Customer360": StructType([
+        StructField("customer_id", StringType(), True),
+        StructField("name", StringType(), True),
+        StructField("email", StringType(), True),
+        StructField("phone", StringType(), True),
+        StructField("region", StringType(), True),
+        StructField("signup_date", DateType(), True),
+        StructField("total_orders", IntegerType(), True),
+        StructField("total_sales", DoubleType(), True),
+        StructField("last_purchase_date", DateType(), True),
+        StructField("days_since_last_purchase", IntegerType(), True),
+        StructField("churn_risk", StringType(), True),
+        StructField("lifetime_value", DoubleType(), True),
+        StructField("act_inactive", StringType(), True),
+        StructField("signup_month", StringType(), True),  # YYYY-MM
+        StructField("signup_year", IntegerType(), True),
+        StructField("support_tickets", IntegerType(), True),
+        StructField("churn_risk_support", StringType(), True)
+    ])
+}
+# --- Step 2: Define your queries and target tables ---
+queries = {
+    "10_cus_lifecycle": "CustomerLifecycle10",
+    "Active_cus(30days)": "ActiveCustomers30Days",
+    "avg_order_value": "AvgOrderValue",
+    "Cust_lifecycle_value": "CustLifecycleValue",
+    "Inactive_cust": "InactiveCustomers",
+    "Revenue_month": "RevenueMonth",
+    "Risk_based_frequency": "RiskBasedFrequency",
+    "Risk_supp_tick": "RiskSupportTickets",
+    "Total_customers": "TotalCustomers",
+    "Churn_probability": "ChurnProbability",
+    "Customer360": "Customer360"
+}
+base_path = "s3://retail-360/athena-results/"
+# --- Step 3: Get DB credentials from Secrets Manager ---
+secret = get_secret()
+username = secret['username']
+password = secret['password']
+host = secret['host']
+port = secret.get('port', '1433')  # default SQL Server port
+database = "Customer360DB"
+jdbc_url = f"jdbc:sqlserver://database-2.cwbuoa6mywhy.us-east-1.rds.amazonaws.com:1433;databaseName=Customer360DB"
+# --- Step 4: Loop through queries ---
+for folder, target_table in queries.items():
+    s3_path = base_path + folder + "/2025/11/22/*.csv"
+    schema = schemas[folder]
+    df = spark.read.option("header", "true").schema(schema).csv(s3_path)
+    if "customer_id" in df.columns:
+        df = df.dropDuplicates(["customer_id"])
+    dyf = DynamicFrame.fromDF(df, glueContext, folder)
+    glueContext.write_dynamic_frame.from_options(
+        frame=dyf,
+        connection_type="sqlserver",
+        connection_options={
+            "url": jdbc_url,
+            "user": username,
+            "password": password,
+            "dbtable": target_table
+        }
+    )
+job.commit()
